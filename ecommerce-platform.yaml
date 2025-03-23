@@ -1,0 +1,339 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Combined CloudFormation Template for the E-commerce Platform.
+  This template creates a VPC, subnets, security groups, an RDS instance,
+  an Auto Scaling Group for web servers (fronted by an Application Load Balancer)
+  that installs the application and configures connect.php dynamically, plus
+  a bastion host for secure SSH access.
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access.
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+    
+  BastionKeyPair:
+    Description: Name of an existing EC2 KeyPair to access the bastion host.
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+
+  MasterUsername:
+    Description: The master username for the RDS MySQL database.
+    Type: String
+
+  MasterPassword:
+    Description: The master password for the RDS MySQL database.
+    Type: String
+    NoEcho: true
+
+  VpcCIDR:
+    Description: CIDR block for the VPC.
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCIDR:
+    Description: CIDR block for the public subnet.
+    Type: String
+    Default: 10.0.1.0/24
+
+  PrivateSubnetCIDR:
+    Description: CIDR block for the private subnet.
+    Type: String
+    Default: 10.0.2.0/24
+
+  WebServerAMI:
+    Description: Amazon Linux 2 free-tier eligible AMI (us-east-1).
+    Type: AWS::EC2::Image::Id
+    Default: ami-04aa00acb1165b32a
+
+  BastionAMI:
+    Description: Amazon Linux 2 free-tier eligible AMI (us-east-1).
+    Type: AWS::EC2::Image::Id
+    Default: ami-04aa00acb1165b32a
+
+  DesiredCapacity:
+    Description: Desired capacity for the web server Auto Scaling Group.
+    Type: Number
+    Default: 1
+
+  MaxSize:
+    Description: Maximum number of instances for the web server Auto Scaling Group.
+    Type: Number
+    Default: 3
+
+  MinSize:
+    Description: Minimum number of instances for the web server Auto Scaling Group.
+    Type: Number
+    Default: 1
+
+Resources:
+  EcommerceVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ecommerce-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EcommerceVPC
+      CidrBlock: !Ref PublicSubnetCIDR
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: ecommerce-public-subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EcommerceVPC
+      CidrBlock: !Ref PrivateSubnetCIDR
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: ecommerce-private-subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ecommerce-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref EcommerceVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EcommerceVPC
+      Tags:
+        - Key: Name
+          Value: ecommerce-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP (80) and SSH (22) access from anywhere.
+      VpcId: !Ref EcommerceVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ecommerce-instance-sg
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL (3306) access from the web servers.
+      VpcId: !Ref EcommerceVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: ecommerce-db-sg
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH access from anywhere to the bastion host.
+      VpcId: !Ref EcommerceVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ecommerce-bastion-sg
+
+  WebServerELBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP access from anywhere to the load balancer.
+      VpcId: !Ref EcommerceVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ecommerce-web-elb-sg
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnets available for the RDS instance"
+      SubnetIds:
+        - !Ref PrivateSubnet
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t2.micro
+      AllocatedStorage: 20
+      Engine: MySQL
+      EngineVersion: "8.0"
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterPassword
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref WebServerAMI
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd git
+            amazon-linux-extras enable php8.0
+            yum install -y php php-mysqlnd mysql
+
+            systemctl start httpd
+            systemctl enable httpd
+
+            mkdir -p /var/www/html/includes
+
+            cd /var/www/html
+            git clone https://github.com/edaviage/818N-E_Commerce_Application.git .
+            chmod -R 755 /var/www/html
+
+            wget https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -O /var/www/html/includes/global.pem
+            chmod 444 /var/www/html/includes/global.pem
+
+            cat > /var/www/html/includes/connect.php <<EOL
+            <?php
+            \$con = mysqli_init();
+            \$con->ssl_set(NULL, NULL, "/var/www/html/includes/global.pem", NULL, NULL);
+            \$con->real_connect('${!GetAtt DBInstance.Endpoint.Address}', '${MasterUsername}', '${MasterPassword}', 'ecommerce_1');
+            if (!\$con) {
+                die("Database connection failed: " . mysqli_connect_error());
+            }
+            ?>
+            EOL
+
+            chmod 644 /var/www/html/includes/connect.php
+
+            mysql -h ${!GetAtt DBInstance.Endpoint.Address} -u '${MasterUsername}' -p'${MasterPassword}' ecommerce_1 < /var/www/html/Database/ecommerce_1.sql
+
+            systemctl reload httpd
+      LaunchTemplateName: WebServerLT
+    DependsOn: DBInstance
+
+  WebServerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs:
+        - !Ref WebServerTargetGroup
+    DependsOn: WebServerLoadBalancer
+
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ecommerce-web-elb
+      Subnets:
+        - !Ref PublicSubnet
+      SecurityGroups:
+        - !Ref WebServerELBSecurityGroup
+      Scheme: internet-facing
+      Type: application
+
+  WebServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref EcommerceVPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200
+
+  WebServerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerTargetGroup
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: !Ref BastionKeyPair
+      ImageId: !Ref BastionAMI
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: ecommerce-bastion
+
+Outputs:
+  WebELBDNSName:
+    Description: DNS name of the Application Load Balancer.
+    Value: !GetAtt WebServerLoadBalancer.DNSName
+
+  DBEndpoint:
+    Description: RDS endpoint address.
+    Value: !GetAtt DBInstance.Endpoint.Address
+
+  BastionPublicIP:
+    Description: Public IP address of the Bastion host.
+    Value: !GetAtt BastionInstance.PublicIp
